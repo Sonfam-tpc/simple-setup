@@ -599,7 +599,6 @@ cdpEndpoints = Contract.selectList [open, deposit, withdraw, mint, burn] >> cdpE
         mint = Contract.endpoint @"Mint" $ \amt -> Contract.handleError Contract.logError $ mintCDP amt
         burn = Contract.endpoint @"Burn" $ \amt -> Contract.handleError Contract.logError $ burnCDP amt  ---}
 -- 
---- Finish Open, I guess the validator doin great, keep it going my bro!
 main :: IO ()
 main = Trace.runEmulatorTraceIO $ do
   w1'  <- Trace.activateContractWallet (knownWallet 1) initEndpoint
