@@ -37,7 +37,7 @@ import qualified Plutus.Contracts.Currency as Currency
 import qualified Plutus.Trace.Emulator as Trace
 import qualified PlutusTx
 import qualified PlutusTx.Eq as Eq
-import qualified PlutusTx.List as PL
+import qualified PlutusTx.Prelude as PL
 import qualified PlutusTx.Numeric as PNum
 import qualified PlutusTx.Ord as POrd
 import PlutusTx.Trace (traceIfFalse, traceError)	
@@ -110,6 +110,7 @@ mkValidator cp dat opts ctx = case opts of
 	        traceIfFalse "Signature Invalid" (signedByUser $ oPubKey (XOpen p)) &&
 	        traceIfFalse "Invalid output user datum" (checkUserDatum p 0 0) &&
 	        traceIfFalse "Invalid Manager datum list" (managerDatumList p) &&
+		traceIfFalse "User already opened" (not $ p `PL.elem` xs) &&
 	        traceIfFalse "Manager NFT not at input value" (nftVal == inVal) &&
 	        traceIfFalse "Manager NFT not at output value" (checkManagerOutputValue nftVal) &&
 	        traceIfFalse "User NFT not at output value" (checkUserOutputValue userVal)
