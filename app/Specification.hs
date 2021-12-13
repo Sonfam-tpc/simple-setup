@@ -101,7 +101,7 @@ collateralRatio = 1.5
 managerNFTTokenName :: Value.TokenName
 managerNFTTokenName = "iTSLA-Manager"
 
-{-# INLINABLE mkValidator #-}
+{-# INLINEABLE mkValidator #-}
 mkValidator :: CDParams -> CDPDatum -> CDPAction -> Ledger.ScriptContext -> Bool
 mkValidator cp dat opts ctx = case opts of
 	XOpen p -> case dat of
@@ -127,6 +127,7 @@ mkValidator cp dat opts ctx = case opts of
 	        traceIfFalse "Signature Invalid" (signedByUser $ p) &&
 	        traceIfFalse "Insufficient balance" (x POrd.< lok) &&
 	        traceIfFalse "Invalid output user datum" (checkUserDatum p (lok PNum.- x) min) &&
+	        traceIfFalse "Wrong input value" (inVal == userVal <> Ada.lovelaceValueOf lok) &&
 	        traceIfFalse "Output value mismatch" (checkUserOutputValue (userVal <> Ada.lovelaceValueOf (lok PNum.- x))) &&
 	        traceIfFalse "Invalid withdraw amount" (x POrd.>0 && x POrd.<=lok) && 
 	        traceIfFalse "Broken collateral ratio" (maintainCR (lok PNum.- x) min)
@@ -270,7 +271,7 @@ cdpValidatorHash = TScripts.validatorHash. cdpInstance
 cdpAddress :: CDParams -> Ledger.Address
 cdpAddress = Ledger.scriptAddress. cdpValidator
 
-{-# INLINABLE mkPolicy #-}
+{-# INLINEABLE mkPolicy #-}
 mkPolicy :: Value.AssetClass -> () -> Ledger.ScriptContext -> Bool
 mkPolicy utk _ ctx = traceIfFalse "Need user CDP" needOneUser
   where
@@ -320,7 +321,7 @@ myCurrencySymbol = Value.mpsSymbol.mintingPolicyHash
 myTokenName :: Value.TokenName
 myTokenName = "iTSLA"
 
-{-# INLINABLE mkUserPolicy #-} -- 
+{-# INLINEABLE mkUserPolicy #-} -- 
 
 mkUserPolicy :: Value.AssetClass -> () -> Ledger.ScriptContext -> Bool
 mkUserPolicy ac _ ctx = traceIfFalse "Input does not contain manager NFT" (nftVal == inVal) &&
