@@ -81,16 +81,18 @@ getDatum o = preview Ledger.ciTxOutDatum o >>= rightToMaybe >>= (PlutusTx.fromBu
 getValue :: Ledger.ChainIndexTxOut -> Ledger.Value
 getValue = view Ledger.ciTxOutValue
 
-isManagerOutput :: Ledger.ChainIndexTxOut -> Bool --- upgrade this
-isManagerOutput inp = case getDatum @CDPDatum inp of
-    Just (ManagerDatum _) -> True
+isManagerOutput :: Value.AssetClass -> Ledger.ChainIndexTxOut -> Bool
+isManagerOutput nft inp = case getDatum @CDPDatum inp of
+    Just (ManagerDatum _) -> (Ledger._ciTxOutValue inp) == (Value.assetClassValue nft 1)
     _                     -> False
 
-isUserCollateralOutput :: Ledger.PubKeyHash -> Ledger.ChainIndexTxOut -> Bool -- get the former utxo as the current input (use PubKey + authToken) ---upgrade this
-isUserCollateralOutput x inp = case getDatum @CDPDatum inp of
-    Just (UserDatum y _ _) -> x == y
-    _                      -> False
-
+isUserCollateralOutput :: Value.AssetClass -> Ledger.PubKeyHash -> Ledger.ChainIndexTxOut -> Bool
+isUserCollateralOutput utk x inp = case getDatum @CDPDatum inp of
+    Just (UserDatum y mon _) -> x == y && chkUserVal (Ledger._ciTxOutValue inp)
+    _                        -> False
+    where
+        chkUserVal :: Value.Value -> Bool
+        chkUserVal val = foldl (||) False [ Value.assetClass a b == utk && c == 1 | (a,b,c) <- Value.flattenValue val]
 eqAssetClass :: Value.AssetClass -> Value.AssetClass -> Bool
 eqAssetClass a b = fst (Value.unAssetClass a) Eq.== fst (Value.unAssetClass b) &&
                    snd (Value.unAssetClass a) Eq.== snd (Value.unAssetClass b)
@@ -110,7 +112,7 @@ mkValidator cp dat opts ctx = case opts of
 	        traceIfFalse "Signature Invalid" (signedByUser $ oPubKey (XOpen p)) &&
 	        traceIfFalse "Invalid output user datum" (checkUserDatum p 0 0) &&
 	        traceIfFalse "Invalid Manager datum list" (managerDatumList p) &&
-		traceIfFalse "User already opened" (not $ p `PL.elem` xs) &&
+	        traceIfFalse "User already opened" (not $ p `PL.elem` xs) &&
 	        traceIfFalse "Manager NFT not at input value" (nftVal == inVal) &&
 	        traceIfFalse "Manager NFT not at output value" (checkManagerOutputValue nftVal) &&
 	        traceIfFalse "User NFT not at output value" (checkUserOutputValue userVal)
@@ -126,7 +128,7 @@ mkValidator cp dat opts ctx = case opts of
 	    ManagerDatum _ -> False
 	    UserDatum p lok min ->
 	        traceIfFalse "Signature Invalid" (signedByUser $ p) &&
-	        traceIfFalse "Insufficient balance" (x POrd.< lok) &&
+	        traceIfFalse "Insufficient balance" (x POrd.<= lok) &&
 	        traceIfFalse "Invalid output user datum" (checkUserDatum p (lok PNum.- x) min) &&
 	        traceIfFalse "Wrong input value" (inVal == userVal <> Ada.lovelaceValueOf lok) &&
 	        traceIfFalse "Output value mismatch" (checkUserOutputValue (userVal <> Ada.lovelaceValueOf (lok PNum.- x))) &&
@@ -243,7 +245,7 @@ mkValidator cp dat opts ctx = case opts of
     signedByUser = Ledger.txSignedBy info
     
     maintainCR :: Integer -> Integer -> Bool
-    maintainCR x y = adaPrice PNum.* x POrd.>= collateralR PNum.* crAsset PNum.* (10 :: Integer)
+    maintainCR x y = adaPrice PNum.* x POrd.>= collateralR PNum.* crAsset PNum.* y PNum.* (10000 :: Integer)
     
     adaPrice :: Integer
     adaPrice = 13
@@ -253,7 +255,6 @@ mkValidator cp dat opts ctx = case opts of
     
     crAsset :: Integer
     crAsset  = 70967
-
     
 cdpInstance :: CDParams -> TScripts.TypedValidator CDP
 cdpInstance cp =
@@ -305,7 +306,6 @@ mkPolicy utk _ ctx = traceIfFalse "Need user CDP" needOneUser
           [_] -> True
           _   -> False
         
-
 mintingPolicy :: Value.AssetClass -> TScripts.MintingPolicy
 mintingPolicy ac =
   Ledger.mkMintingPolicyScript $
@@ -409,7 +409,7 @@ initCDP = do
 
 openCDP :: EPInput -> Contract.Contract w s Contract.ContractError ()
 openCDP inp = do
-      manager    <- Map.filter isManagerOutput <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
+      manager    <- Map.filter (isManagerOutput mtk) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
       userPubKey <- Contract.ownPubKeyHash
       if Map.null manager
          then Contract.throwError "Manager missing!"
@@ -417,171 +417,141 @@ openCDP inp = do
           let
             (oref, o)  = head $ Map.toList manager
             mbListUser = getDatum @CDPDatum o
-            lookup     = Constraints.typedValidatorLookups (cdpInstance $  CDParams (epManagerT inp) (epUserT inp))
-            userToken  = Value.assetClassValue (Value.assetClass (userCurrencySymbol $ (epManagerT inp)) userTokenName) 1
+            lookup     = Constraints.typedValidatorLookups (cdpInstance $  CDParams mtk utk)
+            userToken  = Value.assetClassValue (Value.assetClass (userCurrencySymbol $ mtk) userTokenName) 1
+            mtk        = epManagerT inp
+            utk        = epUserT inp
           case mbListUser of
             Nothing -> Contract.throwError "PubKey list missing"
-            Just listUser -> if userPubKey `elem` (pkhList listUser) then openAlready else do
+            Just listUser -> do
             		   void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
                   	    where
                   	      mngDatum    = ManagerDatum (userPubKey :(pkhList listUser))
-                  	      lookup      = Constraints.typedValidatorLookups (cdpInstance $ CDParams (epManagerT inp) (epUserT inp))
+                  	      lookup      = Constraints.typedValidatorLookups (cdpInstance $ CDParams mtk utk)
                   	                 <> Constraints.unspentOutputs (Map.fromList [(oref, o)])
-                  	                 <> Constraints.otherScript (cdpValidator $ CDParams (epManagerT inp) (epUserT inp))
-                  	                 <> Constraints.mintingPolicy (userMintingPolicy $ (epManagerT inp))
+                  	                 <> Constraints.otherScript (cdpValidator $ CDParams mtk utk)
+                  	                 <> Constraints.mintingPolicy (userMintingPolicy $ mtk)
                    	      constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer $ PlutusTx.toBuiltinData (XOpen userPubKey))
                              	        <> Constraints.mustPayToTheScript mngDatum (Ada.lovelaceValueOf 0 <> getValue o)
   	                        	        <> Constraints.mustPayToTheScript (UserDatum userPubKey 0 0) (Ada.lovelaceValueOf 0 <> userToken)
   	                        	        <> Constraints.mustMintValue userToken
-                  	      openAlready = Contract.logInfo @String "You already opened!"
+  	  where (mtk,utk) = (epManagerT inp, epUserT inp)                      	        
+        
 depositCDP :: EPInput -> Contract.Contract w s Contract.ContractError ()
 depositCDP inp = do
     userPubKey   <- Contract.ownPubKeyHash
-    manager      <- Map.filter isManagerOutput <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
-    myCollateral <- Map.filter (isUserCollateralOutput userPubKey) <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
-    if Map.null myCollateral
-        then Contract.throwError "Please open a CDP in advance, lack collateral fund"
-        else do
-         let
-            (mngOref, mngO) = head $ Map.toList manager
-            (myOref, myO)   = head $ Map.toList myCollateral
-            listUser = pkhList $ fromMaybe (ManagerDatum []) (getDatum @CDPDatum mngO)
-            userDat  = fromMaybe (UserDatum userPubKey 0 0) (getDatum @CDPDatum myO)
-            
-            dp_amount = epAmount inp
-            cur_AdaAmount = myLockedAda userDat
-            cur_MintedToken = myMintedToken userDat
-            newUserDat = (UserDatum userPubKey (dp_amount+cur_AdaAmount) cur_MintedToken)   
-         case userPubKey `elem` listUser of
-            False -> Contract.throwError "Please open a CDP in advance, lack manager output"
-            True -> case dp_amount <= 0 of
-                True  -> Contract.throwError "Please deposit a positve asset"
-                False -> do
-                    void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
-                      where
-                        lookup      = Constraints.typedValidatorLookups (cdpInstance $ CDParams (epManagerT inp) (epUserT inp))
-                  	                <> Constraints.unspentOutputs (Map.fromList [(myOref, myO)])
-                  	                <> Constraints.otherScript (cdpValidator $ CDParams (epManagerT inp) (epUserT inp))
-                        constraints = Constraints.mustSpendScriptOutput myOref (Scripts.Redeemer $ PlutusTx.toBuiltinData (XDeposit userPubKey dp_amount))
-                                    <> Constraints.mustPayToTheScript newUserDat (Ada.lovelaceValueOf dp_amount <> getValue myO)
+    manager      <- Map.filter (isManagerOutput mtk) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
+    myCollateral <- Map.filter (isUserCollateralOutput utk userPubKey) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
+    if Map.null manager
+      then Contract.throwError "Please open a CDP in advance"
+      else do
+        let
+    	  (mngOref, mngO) = head $ Map.toList manager
+          listUser = pkhList $ fromMaybe (ManagerDatum []) (getDatum @CDPDatum mngO)
+        case Map.null myCollateral of
+            True -> Contract.throwError "Please open a CDP in advance, lack collateral fund"
+            False -> do
+                void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
+                    where
+                        lookup = Constraints.typedValidatorLookups (cdpInstance $ CDParams mtk utk)
+                                <> Constraints.unspentOutputs (Map.fromList [(myOref, myO)])
+                                <> Constraints.otherScript (cdpValidator $ CDParams mtk utk)
+                        constraints = Constraints.mustSpendScriptOutput myOref (Scripts.Redeemer $ PlutusTx.toBuiltinData (XDeposit userPubKey dp_amount)) 
+                                <> Constraints.mustPayToTheScript newUserDat (Ada.lovelaceValueOf dp_amount <> getValue myO)
+                        (myOref, myO)  = head $ Map.toList myCollateral
+                        userDat  = fromMaybe (UserDatum userPubKey 0 0) (getDatum @CDPDatum myO)
+                        newUserDat = (UserDatum userPubKey (dp_amount+(myLockedAda userDat)) (myMintedToken userDat))
+    where (mtk,utk,dp_amount) = (epManagerT inp, epUserT inp, epAmount inp)
 
 withdrawCDP :: EPInput -> Contract.Contract w s Contract.ContractError ()
 withdrawCDP inp = do
     userPubKey   <- Contract.ownPubKeyHash
-    manager      <- Map.filter isManagerOutput <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
-    myCollateral <- Map.filter (isUserCollateralOutput userPubKey) <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
-    if Map.null myCollateral
-        then Contract.throwError "Please open a CDP in advance, lack collateral fund"
+    manager      <- Map.filter (isManagerOutput mtk) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
+    myCollateral <- Map.filter (isUserCollateralOutput utk userPubKey) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
+    if Map.null manager
+        then Contract.throwError "Please open a CDP in advance"
         else do
          let
             (mngOref, mngO) = head $ Map.toList manager
-            (myOref, myO)   = head $ Map.toList myCollateral
             listUser = pkhList $ fromMaybe (ManagerDatum []) (getDatum @CDPDatum mngO)
-            userDat  = fromMaybe (UserDatum userPubKey 0 0) (getDatum @CDPDatum myO)
-            
-            wd_amount = epAmount inp
-            cur_AdaAmount = myLockedAda userDat
-            cur_MintedToken = myMintedToken userDat
-            leftover = cur_AdaAmount -wd_amount
-            
-            checkRatio :: Bool
-            checkRatio = 13 * leftover  >= 15 * 70967 * 10^4 * cur_MintedToken
-            
-            newUserDat = (UserDatum userPubKey leftover cur_MintedToken)
-         case userPubKey `elem` listUser of
-            False -> Contract.throwError "Please open a CDP in advance, lack manager output"
-            True -> case leftover < 0 of
-                True  -> Contract.throwError "Insufficient fund"
-                False -> if not checkRatio then Contract.throwError "Your withdrawl breaks the collateral ratio" else do
-                    void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
-                      where
-                        lookup 	= Constraints.typedValidatorLookups (cdpInstance $ CDParams (epManagerT inp) (epUserT inp))
+         case Map.null myCollateral of
+            True -> Contract.throwError "Please open a CDP in advance, lack collateral fund@@@"
+            False -> do
+                void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
+                    where
+                        lookup 	= Constraints.typedValidatorLookups (cdpInstance $ CDParams mtk utk)
                                 	<> Constraints.unspentOutputs (Map.fromList [(myOref, myO)])
-                                	<> Constraints.otherScript (cdpValidator $ CDParams (epManagerT inp) (epUserT inp))
+                                	<> Constraints.otherScript (cdpValidator $ CDParams mtk utk)
                         constraints = Constraints.mustSpendScriptOutput myOref (Scripts.Redeemer $ PlutusTx.toBuiltinData (XWithdraw userPubKey wd_amount))
                                     <> Constraints.mustPayToTheScript newUserDat (Ada.lovelaceValueOf (-wd_amount) <> getValue myO)
+                        (myOref, myO)   = head $ Map.toList myCollateral
+                        userDat  = fromMaybe (UserDatum userPubKey 0 0) (getDatum @CDPDatum myO)
+                        leftover = (myLockedAda userDat) - wd_amount
+                        newUserDat = (UserDatum userPubKey leftover (myMintedToken userDat))
+                        
+    where (mtk,utk, wd_amount) = (epManagerT inp, epUserT inp, epAmount inp)                                
 
 mintCDP :: EPInput -> Contract.Contract w s Contract.ContractError ()
 mintCDP inp = do
     userPubKey   <- Contract.ownPubKeyHash
-    manager      <- Map.filter isManagerOutput <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
-    myCollateral <- Map.filter (isUserCollateralOutput userPubKey) <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
-    if Map.null myCollateral
-        then Contract.throwError "Please open a CDP in advance, lack collateral fund"
+    manager      <- Map.filter (isManagerOutput mtk) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
+    myCollateral <- Map.filter (isUserCollateralOutput utk userPubKey) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
+    if Map.null manager
+        then Contract.throwError "Please open a CDP in advance"
         else do
          let
             (mngOref, mngO) = head $ Map.toList manager
-            (myOref, myO)   = head $ Map.toList myCollateral
             listUser = pkhList $ fromMaybe (ManagerDatum []) (getDatum @CDPDatum mngO)
-            userDat  = fromMaybe (UserDatum userPubKey 0 0) (getDatum @CDPDatum myO)
-            
-            mint_amount = epAmount inp
-            cur_AdaAmount = myLockedAda userDat
-            cur_MintedToken = myMintedToken userDat
-            upd_MintedToken = cur_MintedToken + mint_amount
-            newUserDat = (UserDatum userPubKey cur_AdaAmount upd_MintedToken)
-            
-            checkRatio :: Bool -- create const value for some random number
-            checkRatio = True -- 13 * cur_AdaAmount >= 15 * 70967 * upd_MintedToken --1e4
-            
-            maxAmountMinted :: Integer --- assume that we can only mint a postive integer amount
-            maxAmountMinted = (13 * cur_AdaAmount) `div` (15 * 70967 * 10^4)
-         case userPubKey `elem` listUser of
-            False -> Contract.throwError "Please open a CDP in advance, lack manager output"
-            True  -> case mint_amount > 0 of
-                False -> Contract.throwError "Please mint a positve amount of TSLA"
-                True  -> case checkRatio of
-                    False -> Contract.logInfo @String $ printf "Collatertal ratio broke, please only mint %d lovelace maximum" maxAmountMinted
-                    True  -> do
-                        void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
-                            where
-                                lookup = Constraints.typedValidatorLookups (cdpInstance $ CDParams (epManagerT inp) (epUserT inp))
-                                        <> Constraints.unspentOutputs (Map.fromList [(myOref, myO)])
-                                	    <> Constraints.otherScript (cdpValidator $ CDParams (epManagerT inp) (epUserT inp))
-                                	    <> Constraints.mintingPolicy (mintingPolicy $ (epUserT inp))
+         case Map.null myCollateral of
+            True -> Contract.throwError "Please open a CDP in advance, lack collateral fund"
+            False -> do
+                void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
+                    where
+                        lookup = Constraints.typedValidatorLookups (cdpInstance $ CDParams mtk utk)
+                               <> Constraints.unspentOutputs (Map.fromList [(myOref, myO)])
+                               <> Constraints.otherScript (cdpValidator $ CDParams mtk utk)
+                               <> Constraints.mintingPolicy (mintingPolicy $ utk)
                                 	    
-                                val    = Value.assetClassValue (Value.assetClass (myCurrencySymbol (epUserT inp)) myTokenName) mint_amount
+                        val    = Value.assetClassValue (Value.assetClass (myCurrencySymbol utk) myTokenName) mint_amount
                                 
-                                constraints = Constraints.mustSpendScriptOutput myOref (Scripts.Redeemer $ PlutusTx.toBuiltinData (XMint userPubKey mint_amount))
-                                            <> Constraints.mustPayToTheScript newUserDat (getValue myO)
-                                            <> Constraints.mustMintValue val
+                        constraints = Constraints.mustSpendScriptOutput myOref (Scripts.Redeemer $ PlutusTx.toBuiltinData (XMint userPubKey mint_amount))
+                               <> Constraints.mustPayToTheScript newUserDat (getValue myO)
+                               <> Constraints.mustMintValue val
+                        (myOref, myO)   = head $ Map.toList myCollateral
+                        userDat  = fromMaybe (UserDatum userPubKey 0 0) (getDatum @CDPDatum myO)
+                        newUserDat = UserDatum userPubKey (myLockedAda userDat) (myMintedToken userDat + mint_amount)
+    where (mtk,utk, mint_amount) = (epManagerT inp, epUserT inp, epAmount inp)
 
 burnCDP :: EPInput -> Contract.Contract w s Contract.ContractError ()
 burnCDP inp = do
     userPubKey   <- Contract.ownPubKeyHash
-    manager      <- Map.filter isManagerOutput <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
-    myCollateral <- Map.filter  (isUserCollateralOutput userPubKey) <$> Contract.utxosAt (cdpAddress $ CDParams (epManagerT inp) (epUserT inp))
-    if Map.null myCollateral
-        then Contract.throwError "Please open a CDP in advance, lack collateral fund"
+    manager      <- Map.filter (isManagerOutput mtk) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
+    myCollateral <- Map.filter (isUserCollateralOutput utk userPubKey) <$> Contract.utxosAt (cdpAddress $ CDParams mtk utk)
+    if Map.null manager
+        then Contract.throwError "Please open a CDP in advance"
         else do
          let
             (mngOref, mngO) = head $ Map.toList manager
-            (myOref, myO)   = head $ Map.toList myCollateral
             listUser = pkhList $ fromMaybe (ManagerDatum []) (getDatum @CDPDatum mngO)
-            userDat  = fromMaybe (UserDatum userPubKey 0 0) (getDatum @CDPDatum myO)
-
-            burn_amount = epAmount inp
-            cur_AdaAmount = myLockedAda userDat
-            cur_MintedToken = myMintedToken userDat
-            upd_MintedToken = cur_MintedToken - burn_amount
-            newUserDat = (UserDatum userPubKey cur_AdaAmount upd_MintedToken)
-         case userPubKey `elem` listUser of
-            False -> Contract.throwError "Please open a CDP in advance, lack manager output"
-            True  -> case upd_MintedToken > 0 of
-                False -> Contract.logInfo @String $ printf "Burn exceeds your balance, please burn under %d TSLA" cur_MintedToken
-                True  -> do
-                            void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
-                                where
-                                    lookup = Constraints.typedValidatorLookups (cdpInstance $ CDParams (epManagerT inp) (epUserT inp))
-                                        <> Constraints.unspentOutputs (Map.fromList [(myOref, myO)])
-                                	    <> Constraints.otherScript (cdpValidator $ CDParams (epManagerT inp) (epUserT inp))
-                                	    <> Constraints.mintingPolicy (mintingPolicy $ (epUserT inp))
+         case Map.null myCollateral of
+            True -> Contract.throwError "Please open a CDP in advance, lack collateral fund"
+            False -> do
+                void $ Contract.submitTxConstraintsWith lookup constraints >>= Contract.awaitTxConfirmed. Ledger.getCardanoTxId
+                    where
+                        lookup = Constraints.typedValidatorLookups (cdpInstance $ CDParams mtk utk)
+                                <> Constraints.unspentOutputs (Map.fromList [(myOref, myO)])
+                                <> Constraints.otherScript (cdpValidator $ CDParams mtk utk)
+                                <> Constraints.mintingPolicy (mintingPolicy $ utk)
                                 	    
-                                    val    = Value.assetClassValue (Value.assetClass (myCurrencySymbol (epUserT inp))  myTokenName) (-burn_amount)
+                        val    = Value.assetClassValue (Value.assetClass (myCurrencySymbol utk)  myTokenName) (-burn_amount)
                                 
-                                    constraints = Constraints.mustSpendScriptOutput myOref (Scripts.Redeemer $ PlutusTx.toBuiltinData (XBurn userPubKey burn_amount))
-                                            <> Constraints.mustPayToTheScript newUserDat (getValue myO)
-                                            <> Constraints.mustMintValue val
+                        constraints = Constraints.mustSpendScriptOutput myOref (Scripts.Redeemer $ PlutusTx.toBuiltinData (XBurn userPubKey burn_amount))
+                                <> Constraints.mustPayToTheScript newUserDat (getValue myO)
+                                <> Constraints.mustMintValue val
+                        (myOref, myO)   = head $ Map.toList myCollateral
+                        userDat  = fromMaybe (UserDatum userPubKey 0 0) (getDatum @CDPDatum myO)
+                        newUserDat = (UserDatum userPubKey (myLockedAda userDat) ((myMintedToken userDat) - burn_amount))
+    where (mtk,utk, burn_amount) = (epManagerT inp, epUserT inp, epAmount inp)             
 -- -}
 fromCurrencyError :: Currency.CurrencyError -> Contract.ContractError
 fromCurrencyError = \case
@@ -599,8 +569,8 @@ cdpEndpoints = Contract.selectList [open, deposit, withdraw, mint, burn] >> cdpE
         deposit = Contract.endpoint @"Deposit" $ \amt -> Contract.handleError Contract.logError $ depositCDP amt
         withdraw = Contract.endpoint @"Withdraw" $ \amt -> Contract.handleError Contract.logError $ withdrawCDP amt
         mint = Contract.endpoint @"Mint" $ \amt -> Contract.handleError Contract.logError $ mintCDP amt
-        burn = Contract.endpoint @"Burn" $ \amt -> Contract.handleError Contract.logError $ burnCDP amt  ---}
--- 
+        burn = Contract.endpoint @"Burn" $ \amt -> Contract.handleError Contract.logError $ burnCDP amt
+
 main :: IO ()
 main = Trace.runEmulatorTraceIO $ do
   w1'  <- Trace.activateContractWallet (knownWallet 1) initEndpoint
@@ -623,26 +593,11 @@ main = Trace.runEmulatorTraceIO $ do
   Trace.callEndpoint @"Deposit" w1 $ para 1000000
   void $ Trace.waitNSlots 1
   
-  Trace.callEndpoint @"Deposit" w2 $ para 5030000
-  void $ Trace.waitNSlots 1
- 
-  Trace.callEndpoint @"Deposit" w1 $ para 1000001
-  void $ Trace.waitNSlots 1
-  
-  Trace.callEndpoint @"Withdraw" w1 $ para 1000001
-  void $ Trace.waitNSlots 1
+--  Trace.callEndpoint @"Deposit" w1 $ para 5030000
+--  void $ Trace.waitNSlots 1
 
-  Trace.callEndpoint @"Withdraw" w2 $ para 1000001
+  Trace.callEndpoint @"Withdraw" w1 $ para 1000000
   void $ Trace.waitNSlots 1
-  
-  Trace.callEndpoint @"Mint" w1 $ para 13
-  void $ Trace.waitNSlots 1
-
-  Trace.callEndpoint @"Mint" w1 $ para 1
-  void $ Trace.waitNSlots 1
-  
-  Trace.callEndpoint @"Burn" w1 $ para 3
-  void $ Trace.waitNSlots 1 
   return() 
   where
     getParam :: Trace.ContractHandle (Last (Value.AssetClass, Value.AssetClass)) InitSchema Contract.ContractError -> Trace.EmulatorTrace (Value.AssetClass, Value.AssetClass)
@@ -650,4 +605,3 @@ main = Trace.runEmulatorTraceIO $ do
       Trace.observableState h >>= \case
         Last (Just (p,p1)) -> return (p,p1)
         Last _        -> Trace.waitNSlots 1 >> getParam h
--- -}
